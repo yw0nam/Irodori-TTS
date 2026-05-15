@@ -45,7 +45,9 @@ import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 from huggingface_hub import hf_hub_download
+from pydantic import BaseModel, Field
 
+from irodori_tts.eos import find_eos_and_split, warmup as warmup_eos
 from irodori_tts.inference_runtime import (
     InferenceRuntime,
     RuntimeKey,
@@ -174,6 +176,9 @@ async def _lifespan(app: FastAPI, args: argparse.Namespace) -> AsyncIterator[Non
     executor = ThreadPoolExecutor(max_workers=num_workers, thread_name_prefix="tts-worker")
     logger.info("pool ready: %d worker(s) on %s", num_workers, worker_devices)
 
+    warmup_eos()
+    logger.info("fast-bunkai splitter warmed up.")
+
     app.state.pool = pool
     app.state.executor = executor
 
@@ -271,6 +276,21 @@ def health(request: Request) -> dict:
     if pool is None:
         return {"status": "starting", "pool_size": 0, "available": 0}
     return {"status": "ok", "pool_size": pool.size, "available": pool.available}
+
+
+class EosRequest(BaseModel):
+    text: str = Field(..., description="Raw input text to segment into sentences.")
+
+
+class EosResponse(BaseModel):
+    positions: list[int] = Field(default_factory=list)
+    sentences: list[str] = Field(default_factory=list)
+
+
+@app.post("/eos", response_model=EosResponse)
+async def eos(req: EosRequest) -> EosResponse:
+    positions, sentences = find_eos_and_split(req.text)
+    return EosResponse(positions=positions, sentences=sentences)
 
 
 # ---------------------------------------------------------------------------
