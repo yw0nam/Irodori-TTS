@@ -67,13 +67,17 @@ uv sync --extra cu128
 # AMD ROCm on Linux/WSL
 uv sync --extra rocm
 
+# Intel XPU on Linux/Windows
+uv sync --extra xpu
+
 # CPU-only, or macOS CPU/MPS via PyPI
 uv sync --extra cpu
 ```
 
 The PyTorch backend extras are mutually exclusive. The `cu128` extra uses the
-PyTorch CUDA 12.8 index, and the `rocm` extra uses the PyTorch ROCm index on
-Linux. The `cpu` extra uses the CPU PyTorch index on Linux/Windows and falls
+PyTorch CUDA 12.8 index, the `rocm` extra uses the PyTorch ROCm index on
+Linux, and the `xpu` extra uses the PyTorch XPU index on Linux/Windows.
+The `cpu` extra uses the CPU PyTorch index on Linux/Windows and falls
 back to the standard PyPI PyTorch wheels on macOS.
 
 The `rocm` extra includes `pytorch-triton-rocm` because `triton-rocm` alone does

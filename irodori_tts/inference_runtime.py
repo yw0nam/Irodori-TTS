@@ -40,6 +40,13 @@ def _is_mps_available() -> bool:
     return bool(torch.backends.mps.is_available())
 
 
+def _is_xpu_available() -> bool:
+    try:
+        return bool(torch.xpu.is_available())
+    except AttributeError:
+        return False
+
+
 def resolve_runtime_device(device: str | torch.device) -> torch.device:
     resolved = torch.device(device)
     if resolved.type == "cpu":
@@ -54,7 +61,13 @@ def resolve_runtime_device(device: str | torch.device) -> torch.device:
         if not _is_mps_available():
             raise ValueError("MPS device requested but torch.backends.mps.is_available() is False.")
         return torch.device("mps")
-    raise ValueError(f"Unsupported inference device={resolved!s}. Expected one of: cpu, cuda, mps.")
+    if resolved.type == "xpu":
+        if resolved.index is not None:
+            raise ValueError("XPU device index is not supported. Use 'xpu'.")
+        if not _is_xpu_available():
+            raise ValueError("XPU device requested but torch.xpu.is_available() is False.")
+        return torch.device("xpu")
+    raise ValueError(f"Unsupported inference device={resolved!s}. Expected one of: cpu, cuda, mps, xpu.")
 
 
 def list_available_runtime_devices() -> list[str]:
@@ -63,6 +76,8 @@ def list_available_runtime_devices() -> list[str]:
         devices.append("cuda")
     if _is_mps_available():
         devices.append("mps")
+    if _is_xpu_available():
+        devices.append("xpu")
     devices.append("cpu")
     return devices
 
@@ -73,7 +88,7 @@ def default_runtime_device() -> str:
 
 def list_available_runtime_precisions(device: str | torch.device) -> list[str]:
     resolved = resolve_runtime_device(device)
-    if resolved.type == "cuda":
+    if resolved.type in ("cuda", "xpu"):
         return ["fp32", "bf16"]
     return ["fp32"]
 
@@ -85,6 +100,10 @@ def _sync_device(device: torch.device) -> None:
         mps = getattr(torch, "mps", None)
         if mps is not None and hasattr(mps, "synchronize"):
             mps.synchronize()
+    elif device.type == "xpu":
+        xpu = getattr(torch, "xpu", None)
+        if xpu is not None and hasattr(xpu, "synchronize"):
+            xpu.synchronize()
 
 
 def _sync_devices(*devices: torch.device) -> None:
@@ -276,8 +295,8 @@ def resolve_runtime_dtype(*, precision: str, device: torch.device) -> torch.dtyp
     if mode == "fp32":
         return torch.float32
     if mode == "bf16":
-        if device.type != "cuda":
-            raise ValueError("precision='bf16' currently requires CUDA device.")
+        if device.type not in ("cuda", "xpu"):
+            raise ValueError("precision='bf16' currently requires CUDA or XPU device.")
         return torch.bfloat16
     raise ValueError(f"Unsupported precision={precision!r}. Expected one of: fp32, bf16.")
 
@@ -1207,6 +1226,10 @@ class InferenceRuntime:
                 mps = getattr(torch, "mps", None)
                 if mps is not None and hasattr(mps, "empty_cache"):
                     mps.empty_cache()
+            elif device.type == "xpu":
+                xpu = getattr(torch, "xpu", None)
+                if xpu is not None and hasattr(xpu, "empty_cache"):
+                    xpu.empty_cache()
 
 
 _RUNTIME_CACHE_LOCK = threading.Lock()
