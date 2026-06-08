@@ -188,6 +188,7 @@ class RuntimeKey:
     codec_deterministic_decode: bool = True
     compile_model: bool = False
     compile_dynamic: bool = False
+    enable_watermark: bool = False
 
 
 @dataclass
