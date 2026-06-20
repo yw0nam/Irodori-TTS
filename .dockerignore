@@ -1,0 +1,6 @@
+.venv
+.git
+__pycache__
+outputs
+test_outputs
+*.log

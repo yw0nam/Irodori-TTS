@@ -198,6 +198,11 @@ class SamplingRequest:
     ref_wav: str | None = None
     ref_latent: str | None = None
     ref_embed: str | None = None
+    # In-memory CPU latent (1, T, latent_dim) precomputed via
+    # `encode_reference_latent`. When set, it bypasses the expensive codec
+    # encode — used by the API server's reference cache. Takes priority over
+    # ref_wav/ref_latent.
+    ref_latent_tensor: torch.Tensor | None = None
     no_ref: bool = False
     ref_normalize_db: float | None = -16.0
     ref_ensure_max: bool = True
@@ -666,6 +671,35 @@ class InferenceRuntime:
         self.model.eval()
         return nullcontext()
 
+    def encode_reference_latent(
+        self,
+        ref_wav: str,
+        *,
+        normalize_db: float | None = -16.0,
+        ensure_max: bool = True,
+        max_ref_seconds: float | None = 30.0,
+    ) -> torch.Tensor:
+        """Encode a reference waveform into a CPU latent tensor (1, T, latent_dim).
+
+        This is the expensive part of reference preprocessing (the codec encode).
+        The result is device-agnostic (CPU) and reusable: cache it and feed it
+        back through ``SamplingRequest.ref_latent_tensor`` to skip the encode on
+        later syntheses with the same reference. Note: ``normalize_db`` and
+        ``ensure_max`` are baked into the returned latent, so a cached latent
+        reflects the values used at encode time.
+        """
+        wav, sr = _load_audio(ref_wav)
+        if max_ref_seconds is not None and max_ref_seconds > 0:
+            max_ref_samples = max(1, int(float(max_ref_seconds) * float(sr)))
+            if wav.shape[1] > max_ref_samples:
+                wav = wav[:, :max_ref_samples]
+        return self.codec.encode_waveform(
+            wav.unsqueeze(0),
+            sample_rate=int(sr),
+            normalize_db=normalize_db,
+            ensure_max=bool(ensure_max),
+        ).cpu()
+
     def _load_reference_latent(
         self,
         *,
@@ -675,7 +709,11 @@ class InferenceRuntime:
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         runtime_dtype = next(self.model.parameters()).dtype
         if not self.model_cfg.use_speaker_condition:
-            if req.ref_wav is not None or req.ref_latent is not None:
+            if (
+                req.ref_wav is not None
+                or req.ref_latent is not None
+                or req.ref_latent_tensor is not None
+            ):
                 messages.append(
                     "info: speaker conditioning is disabled for this checkpoint; ignoring reference input."
                 )
@@ -696,7 +734,11 @@ class InferenceRuntime:
             )
             return ref_latent_patched, ref_mask
 
-        if req.ref_wav is None and req.ref_latent is None:
+        if (
+            req.ref_wav is None
+            and req.ref_latent is None
+            and req.ref_latent_tensor is None
+        ):
             raise ValueError("Specify either ref_wav/ref_latent, or set no_ref=True.")
 
         max_ref_latent_steps = None
@@ -710,7 +752,12 @@ class InferenceRuntime:
                 ),
             )
 
-        if req.ref_latent is not None:
+        if req.ref_latent_tensor is not None:
+            ref_latent = req.ref_latent_tensor
+            if ref_latent.dim() == 2:
+                ref_latent = ref_latent.unsqueeze(0)
+            ref_latent = ref_latent.to(dtype=runtime_dtype)
+        elif req.ref_latent is not None:
             latent_raw = torch.load(req.ref_latent, map_location="cpu", weights_only=True)
             ref_latent = _coerce_latent_shape(
                 latent_raw, latent_dim=self.model_cfg.latent_dim
