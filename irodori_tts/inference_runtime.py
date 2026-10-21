@@ -1523,6 +1523,14 @@ class InferenceRuntime:
                 batch_size=num_candidates,
                 messages=messages,
             )
+            # Batch right-padding hides the model's own short-reference check.
+            ref_len = 0 if ref_mask is None else int(ref_mask[0].sum())
+            speaker_patch_size = self.model_cfg.speaker_patch_size
+            if 0 < ref_len < speaker_patch_size:
+                raise ValueError(
+                    f"Reference sequence too short for speaker_patch_size={speaker_patch_size}: "
+                    f"seq_len={ref_len}"
+                )
         else:
             ref_latent, ref_mask = None, None
         stage_sec = _measure_end(self.model_device, t0, self.codec_device)
