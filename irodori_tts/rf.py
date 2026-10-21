@@ -16,6 +16,20 @@ def _make_rng(seed: int, device: torch.device) -> tuple[torch.Generator, torch.d
         return torch.Generator(device="cpu").manual_seed(seed), torch.device("cpu")
 
 
+def draw_initial_noise(
+    seed: int,
+    shape: tuple[int, int, int],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Generator, torch.device]:
+    rng, rng_device = _make_rng(seed=seed, device=device)
+    noise = torch.randn(shape, device=rng_device, dtype=dtype, generator=rng)
+    if rng_device != device:
+        noise = noise.to(device=device)
+    return noise, rng, rng_device
+
+
 def sample_logit_normal_t(
     batch_size: int,
     device: torch.device,
@@ -143,6 +157,8 @@ def sample_euler_rf_cfg(
     speaker_kv_min_t: float | None = None,
     t_schedule_mode: str = "linear",
     sway_coeff: float = -1.0,
+    latent_mask: torch.Tensor | None = None,
+    initial_noise: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Euler sampling over RF ODE with text/reference/caption conditioning CFG.
@@ -155,12 +171,12 @@ def sample_euler_rf_cfg(
     batch_size = text_input_ids.shape[0]
     latent_dim = model.cfg.patched_latent_dim
 
-    rng, rng_device = _make_rng(seed=seed, device=device)
-    x_t = torch.randn(
-        (batch_size, sequence_length, latent_dim), device=rng_device, dtype=dtype, generator=rng
-    )
-    if rng_device != device:
-        x_t = x_t.to(device=device)
+    if initial_noise is None:
+        x_t, rng, rng_device = draw_initial_noise(
+            seed, (batch_size, sequence_length, latent_dim), device=device, dtype=dtype
+        )
+    else:
+        x_t = initial_noise.to(device=device, dtype=dtype)
     if truncation_factor is not None:
         x_t = x_t * float(truncation_factor)
 
@@ -177,6 +193,11 @@ def sample_euler_rf_cfg(
         raise ValueError(
             f"speaker_uncond_mode must be one of {sorted(SPEAKER_INVERSION_UNCOND_MODES)}, "
             f"got {speaker_uncond_mode!r}"
+        )
+    if initial_noise is not None and speaker_uncond_mode == "noise":
+        raise ValueError(
+            "initial_noise cannot be combined with speaker_uncond_mode='noise', "
+            "which draws from the per-call RNG."
         )
 
     cfg_guidance_mode = str(cfg_guidance_mode).strip().lower()
@@ -339,6 +360,7 @@ def sample_euler_rf_cfg(
                 )
             )
     cfg_batch_mult = len(independent_bundles)
+    latent_mask_cfg = None if latent_mask is None else latent_mask.repeat(cfg_batch_mult, 1)
 
     def _cat_optional_tensors(values: list[torch.Tensor | None]) -> torch.Tensor | None:
         present = [value for value in values if value is not None]
@@ -475,6 +497,7 @@ def sample_euler_rf_cfg(
                     speaker_mask=independent_speaker_mask,
                     caption_state=independent_caption_state,
                     caption_mask=independent_caption_mask,
+                    latent_mask=latent_mask_cfg,
                     context_kv_cache=context_kv_cfg,
                 )
                 chunks = v_out.chunk(cfg_batch_mult, dim=0)
@@ -491,6 +514,7 @@ def sample_euler_rf_cfg(
                     speaker_mask=speaker_mask_cond,
                     caption_state=caption_state_cond,
                     caption_mask=caption_mask_cond,
+                    latent_mask=latent_mask,
                     context_kv_cache=context_kv_cond,
                 )
                 if use_joint_cfg:
@@ -511,6 +535,7 @@ def sample_euler_rf_cfg(
                         speaker_mask=joint_uncond_bundle[3],
                         caption_state=joint_uncond_bundle[4],
                         caption_mask=joint_uncond_bundle[5],
+                        latent_mask=latent_mask,
                         context_kv_cache=context_kv_joint_uncond,
                     )
                     v = v_cond + joint_scale * (v_cond - v_uncond_joint)
@@ -526,6 +551,7 @@ def sample_euler_rf_cfg(
                         speaker_mask=alt_bundle[3],
                         caption_state=alt_bundle[4],
                         caption_mask=alt_bundle[5],
+                        latent_mask=latent_mask,
                         context_kv_cache=context_kv_alternating.get(alt_name),
                     )
                     v = v_cond + cfg_scales[alt_name] * (v_cond - v_uncond_alt)
@@ -541,6 +567,7 @@ def sample_euler_rf_cfg(
                 speaker_mask=speaker_mask_cond,
                 caption_state=caption_state_cond,
                 caption_mask=caption_mask_cond,
+                latent_mask=latent_mask,
                 context_kv_cache=context_kv_cond,
             )
 

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import torch
 
 from .model import TextToLatentRFDiT
-from .rf import _make_rng
+from .rf import draw_initial_noise
 
 
 @dataclass(frozen=True)
@@ -503,6 +503,8 @@ def sample_euler_meanflow(
     speaker_uncond_mode: str = "mask",
     num_steps: int = 4,
     seed: int = 0,
+    latent_mask: torch.Tensor | None = None,
+    initial_noise: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Linear MeanFlow sampler from Irodori time 1 to 0 (default: 4 NFE)."""
     if str(model.cfg.flow_parameterization).strip().lower() != "meanflow":
@@ -513,15 +515,15 @@ def sample_euler_meanflow(
     device = model.device
     dtype = model.dtype
     batch_size = text_input_ids.shape[0]
-    rng, rng_device = _make_rng(seed=seed, device=device)
-    x_t = torch.randn(
-        (batch_size, sequence_length, model.cfg.patched_latent_dim),
-        device=rng_device,
-        dtype=dtype,
-        generator=rng,
-    )
-    if rng_device != device:
-        x_t = x_t.to(device=device)
+    if initial_noise is None:
+        x_t = draw_initial_noise(
+            seed,
+            (batch_size, sequence_length, model.cfg.patched_latent_dim),
+            device=device,
+            dtype=dtype,
+        )[0]
+    else:
+        x_t = initial_noise.to(device=device, dtype=dtype)
 
     encoded = EncodedConditions(
         *model.encode_conditions(
@@ -557,6 +559,7 @@ def sample_euler_meanflow(
             speaker_mask=encoded.speaker_mask,
             caption_state=encoded.caption_state,
             caption_mask=encoded.caption_mask,
+            latent_mask=latent_mask,
             context_kv_cache=context_kv_cache,
         )
         x_t = x_t + velocity * (next_value - t_value)
