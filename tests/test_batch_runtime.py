@@ -143,8 +143,8 @@ def test_batch_compatibility_key() -> None:
     assert batch_compatibility_key(replace(base, speaker_uncond_mode="noise")) is None
 
 
-def write_ref_wav(path, seed: int) -> str:
-    audio = torch.randn(80, generator=torch.Generator().manual_seed(seed)).numpy() * 0.1
+def write_ref_wav(path, seed: int, samples: int = 80) -> str:
+    audio = torch.randn(samples, generator=torch.Generator().manual_seed(seed)).numpy() * 0.1
     sf.write(path, audio, 80)
     return str(path)
 
@@ -160,7 +160,7 @@ def test_reference_wavs_are_encoded_once_per_unchanged_file(runtime, tmp_path) -
     assert second.messages == first.messages
     torch.testing.assert_close(second.audios[0], first.audios[0])
 
-    write_ref_wav(tmp_path / "ref1.wav", seed=9)
+    write_ref_wav(tmp_path / "ref1.wav", seed=9, samples=160)
     third = runtime.synthesize(req)
 
     assert runtime.codec.encode_calls == 4
