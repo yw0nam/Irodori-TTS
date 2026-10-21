@@ -7,6 +7,7 @@ import math
 import secrets
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -453,6 +454,7 @@ _INFERENCE_INT_CONFIG_KEYS = {
 _INFERENCE_FLOAT_CONFIG_KEYS = {"ref_max_seconds"}
 _INFERENCE_CONFIG_KEYS = _INFERENCE_INT_CONFIG_KEYS | _INFERENCE_FLOAT_CONFIG_KEYS
 _LEGACY_MAX_REF_SECONDS = 30.0
+_REFERENCE_LATENT_CACHE_SIZE = 32
 
 
 def _load_checkpoint_from_pt(
@@ -702,6 +704,7 @@ class InferenceRuntime:
         self._infer_lock = threading.Lock()
         self._model_dtype = next(self.model.parameters()).dtype
         self._lora_adapter_names: dict[str, str] = {}
+        self._reference_latents: OrderedDict[tuple, tuple[torch.Tensor, list[str]]] = OrderedDict()
 
     @classmethod
     def from_key(cls, key: RuntimeKey) -> InferenceRuntime:
@@ -998,46 +1001,20 @@ class InferenceRuntime:
                     f"in input order ({ref_latent.shape[1]} steps before max-length trimming)."
                 )
         else:
-            if req.ref_normalize_db is not None:
-                messages.append(
-                    f"info: reference loudness normalize enabled per clip (target_db={float(req.ref_normalize_db):.2f}, includes peak safety scaling)."
+            key = _reference_latent_key(req, wav_paths, max_ref_seconds)
+            if key in self._reference_latents:
+                self._reference_latents.move_to_end(key)
+            else:
+                self._reference_latents[key] = self._encode_reference_wavs(
+                    req=req,
+                    wav_paths=wav_paths,
+                    max_ref_seconds=max_ref_seconds,
+                    max_ref_latent_steps=max_ref_latent_steps,
                 )
-            elif req.ref_ensure_max:
-                messages.append(
-                    "info: reference peak safety scaling enabled per clip (ensure_max=True)."
-                )
-            latent_pieces = []
-            for path in wav_paths:
-                wav, sr = _load_audio(path)
-                if len(wav_paths) == 1 and max_ref_seconds > 0:
-                    max_ref_samples = max(1, int(max_ref_seconds * float(sr)))
-                    if wav.shape[1] > max_ref_samples:
-                        messages.append(
-                            f"warning: reference audio exceeds max_ref_seconds ({max_ref_seconds}s). "
-                            f"Trimming from {float(wav.shape[1]) / float(sr):.2f}s to {float(max_ref_samples) / float(sr):.2f}s."
-                        )
-                        wav = wav[:, :max_ref_samples]
-                piece = self.codec.encode_waveform(
-                    wav.unsqueeze(0),
-                    sample_rate=int(sr),
-                    normalize_db=req.ref_normalize_db,
-                    ensure_max=bool(req.ref_ensure_max),
-                ).cpu()
-                if piece.shape[1] == 0:
-                    raise ValueError(f"Reference waveform produced an empty latent: {path}")
-                latent_pieces.append(piece)
-                if (
-                    max_ref_latent_steps is not None
-                    and sum(int(item.shape[1]) for item in latent_pieces) >= max_ref_latent_steps
-                ):
-                    break
-            ref_latent = torch.cat(latent_pieces, dim=1)
-            if len(wav_paths) > 1:
-                messages.append(
-                    f"info: encoded and concatenated {len(latent_pieces)}/{len(wav_paths)} "
-                    "reference waveforms in input order "
-                    f"({ref_latent.shape[1]} latent steps before max-length trimming)."
-                )
+                if len(self._reference_latents) > _REFERENCE_LATENT_CACHE_SIZE:
+                    self._reference_latents.popitem(last=False)
+            ref_latent, branch_messages = self._reference_latents[key]
+            messages.extend(branch_messages)
 
         if max_ref_latent_steps is not None and ref_latent.shape[1] > max_ref_latent_steps:
             messages.append(
@@ -1063,6 +1040,57 @@ class InferenceRuntime:
             device=self.model_device,
         )
         return ref_latent_patched, ref_mask
+
+    def _encode_reference_wavs(
+        self,
+        *,
+        req: SamplingRequest,
+        wav_paths: list[str],
+        max_ref_seconds: float,
+        max_ref_latent_steps: int | None,
+    ) -> tuple[torch.Tensor, list[str]]:
+        messages: list[str] = []
+        if req.ref_normalize_db is not None:
+            messages.append(
+                f"info: reference loudness normalize enabled per clip (target_db={float(req.ref_normalize_db):.2f}, includes peak safety scaling)."
+            )
+        elif req.ref_ensure_max:
+            messages.append(
+                "info: reference peak safety scaling enabled per clip (ensure_max=True)."
+            )
+        latent_pieces = []
+        for path in wav_paths:
+            wav, sr = _load_audio(path)
+            if len(wav_paths) == 1 and max_ref_seconds > 0:
+                max_ref_samples = max(1, int(max_ref_seconds * float(sr)))
+                if wav.shape[1] > max_ref_samples:
+                    messages.append(
+                        f"warning: reference audio exceeds max_ref_seconds ({max_ref_seconds}s). "
+                        f"Trimming from {float(wav.shape[1]) / float(sr):.2f}s to {float(max_ref_samples) / float(sr):.2f}s."
+                    )
+                    wav = wav[:, :max_ref_samples]
+            piece = self.codec.encode_waveform(
+                wav.unsqueeze(0),
+                sample_rate=int(sr),
+                normalize_db=req.ref_normalize_db,
+                ensure_max=bool(req.ref_ensure_max),
+            ).cpu()
+            if piece.shape[1] == 0:
+                raise ValueError(f"Reference waveform produced an empty latent: {path}")
+            latent_pieces.append(piece)
+            if (
+                max_ref_latent_steps is not None
+                and sum(int(item.shape[1]) for item in latent_pieces) >= max_ref_latent_steps
+            ):
+                break
+        ref_latent = torch.cat(latent_pieces, dim=1)
+        if len(wav_paths) > 1:
+            messages.append(
+                f"info: encoded and concatenated {len(latent_pieces)}/{len(wav_paths)} "
+                "reference waveforms in input order "
+                f"({ref_latent.shape[1]} latent steps before max-length trimming)."
+            )
+        return ref_latent, messages
 
     def _load_speaker_embedding_condition(
         self,
@@ -1795,6 +1823,15 @@ def clear_cached_runtime() -> None:
 
     if runtime is not None:
         runtime.unload()
+
+
+def _reference_latent_key(
+    req: SamplingRequest, wav_paths: list[str], max_ref_seconds: float
+) -> tuple:
+    files = tuple(
+        (str(Path(p).resolve()), (st := Path(p).stat()).st_mtime_ns, st.st_size) for p in wav_paths
+    )
+    return (files, req.ref_normalize_db, bool(req.ref_ensure_max), max_ref_seconds)
 
 
 def _load_audio(path: str | Path) -> tuple[torch.Tensor, int]:

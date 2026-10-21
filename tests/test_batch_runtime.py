@@ -4,6 +4,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
+import soundfile as sf
 import torch
 
 from irodori_tts.inference_runtime import (
@@ -31,6 +32,16 @@ class FakeTokenizer:
 class FakeCodec:
     sample_rate = 80
     model = SimpleNamespace(hop_length=HOP_LENGTH)
+    latent_dim = 4
+
+    def __init__(self) -> None:
+        self.encode_calls = 0
+
+    def encode_waveform(self, wav: torch.Tensor, **_) -> torch.Tensor:
+        self.encode_calls += 1
+        steps = wav.shape[-1] // HOP_LENGTH
+        frames = wav[0, 0, : steps * HOP_LENGTH].reshape(steps, HOP_LENGTH).mean(-1)
+        return frames[None, :, None].repeat(1, 1, self.latent_dim)
 
     def decode_latent(self, z: torch.Tensor) -> torch.Tensor:
         return z.mean(-1).repeat_interleave(HOP_LENGTH, dim=-1).unsqueeze(1)
@@ -130,3 +141,27 @@ def test_batch_compatibility_key() -> None:
         replace(base, ref_wav=None, no_ref=True)
     )
     assert batch_compatibility_key(replace(base, speaker_uncond_mode="noise")) is None
+
+
+def write_ref_wav(path, seed: int, samples: int = 80) -> str:
+    audio = torch.randn(samples, generator=torch.Generator().manual_seed(seed)).numpy() * 0.1
+    sf.write(path, audio, 80)
+    return str(path)
+
+
+def test_reference_wavs_are_encoded_once_per_unchanged_file(runtime, tmp_path) -> None:
+    paths = [write_ref_wav(tmp_path / f"ref{i}.wav", seed=i) for i in range(2)]
+    req = SamplingRequest(text="hi", ref_wavs=paths, seconds=0.5, seed=1, num_steps=4)
+
+    first = runtime.synthesize(req)
+    second = runtime.synthesize(req)
+
+    assert runtime.codec.encode_calls == 2
+    assert second.messages == first.messages
+    torch.testing.assert_close(second.audios[0], first.audios[0])
+
+    write_ref_wav(tmp_path / "ref1.wav", seed=9, samples=160)
+    third = runtime.synthesize(req)
+
+    assert runtime.codec.encode_calls == 4
+    assert not torch.equal(third.audios[0], first.audios[0])
