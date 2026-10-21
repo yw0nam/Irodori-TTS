@@ -16,7 +16,7 @@ def _make_rng(seed: int, device: torch.device) -> tuple[torch.Generator, torch.d
         return torch.Generator(device="cpu").manual_seed(seed), torch.device("cpu")
 
 
-def initial_noise(
+def draw_initial_noise(
     seed: int,
     shape: tuple[int, int, int],
     *,
@@ -28,10 +28,6 @@ def initial_noise(
     if rng_device != device:
         noise = noise.to(device=device)
     return noise, rng, rng_device
-
-
-# Samplers take an `initial_noise` keyword that shadows the function name.
-_draw_initial_noise = initial_noise
 
 
 def sample_logit_normal_t(
@@ -176,7 +172,7 @@ def sample_euler_rf_cfg(
     latent_dim = model.cfg.patched_latent_dim
 
     if initial_noise is None:
-        x_t, rng, rng_device = _draw_initial_noise(
+        x_t, rng, rng_device = draw_initial_noise(
             seed, (batch_size, sequence_length, latent_dim), device=device, dtype=dtype
         )
     else:

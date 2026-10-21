@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import torch
 
 from .model import TextToLatentRFDiT
-from .rf import _draw_initial_noise
+from .rf import draw_initial_noise
 
 
 @dataclass(frozen=True)
@@ -516,7 +516,7 @@ def sample_euler_meanflow(
     dtype = model.dtype
     batch_size = text_input_ids.shape[0]
     if initial_noise is None:
-        x_t = _draw_initial_noise(
+        x_t = draw_initial_noise(
             seed,
             (batch_size, sequence_length, model.cfg.patched_latent_dim),
             device=device,

@@ -29,7 +29,7 @@ from .quantization import (
     parse_quantization_metadata,
     unflatten_quantized_state_dict,
 )
-from .rf import initial_noise, sample_euler_rf_cfg
+from .rf import draw_initial_noise, sample_euler_rf_cfg
 from .speaker_inversion import (
     load_speaker_inversion_payload,
     speaker_inversion_batch_tensors,
@@ -1190,7 +1190,7 @@ class InferenceRuntime:
                     ),
                     "initial_noise": _right_pad_cat(
                         [
-                            initial_noise(
+                            draw_initial_noise(
                                 plan.used_seed,
                                 (
                                     plan.num_candidates,

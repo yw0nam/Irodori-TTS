@@ -5,7 +5,7 @@ import torch
 
 from irodori_tts.meanflow import sample_euler_meanflow
 from irodori_tts.model import TextToLatentRFDiT
-from irodori_tts.rf import initial_noise, sample_euler_rf_cfg
+from irodori_tts.rf import draw_initial_noise, sample_euler_rf_cfg
 
 # (text_len, ref_len, patched_steps, seed) per request.
 REQUESTS = [(3, 4, 5, 11), (6, 7, 9, 22)]
@@ -56,7 +56,7 @@ def run_single_and_batched(model: TextToLatentRFDiT, sampler, **kwargs):
     noise = torch.cat(
         [
             right_pad(
-                initial_noise(
+                draw_initial_noise(
                     seed,
                     (1, s, model.cfg.patched_latent_dim),
                     device=model.device,
