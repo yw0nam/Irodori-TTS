@@ -115,7 +115,7 @@ def test_meanflow_batch_rows_match_single_runs(tiny_model) -> None:
 def test_rf_initial_noise_rejects_speaker_noise_uncond(tiny_model) -> None:
     model = tiny_model()
     text_ids, ref, steps, _ = request_inputs(model)[0]
-    with pytest.raises(ValueError, match="noise"):
+    with pytest.raises(ValueError, match="initial_noise cannot be combined"):
         sample_euler_rf_cfg(
             model=model,
             text_input_ids=text_ids,
