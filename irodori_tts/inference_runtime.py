@@ -7,7 +7,7 @@ import math
 import secrets
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,7 +29,7 @@ from .quantization import (
     parse_quantization_metadata,
     unflatten_quantized_state_dict,
 )
-from .rf import sample_euler_rf_cfg
+from .rf import initial_noise, sample_euler_rf_cfg
 from .speaker_inversion import (
     load_speaker_inversion_payload,
     speaker_inversion_batch_tensors,
@@ -256,6 +256,88 @@ class SamplingResult:
     total_to_decode: float
     used_seed: int
     messages: list[str]
+
+
+def batch_compatibility_key(req: SamplingRequest) -> tuple | None:
+    """Requests with equal keys can share one synthesize_batch call."""
+    if str(req.speaker_uncond_mode).strip().lower() == "noise":
+        return None
+    if req.ref_embed is not None:
+        speaker_kind = "embed"
+    elif req.no_ref:
+        speaker_kind = "none"
+    else:
+        speaker_kind = "reference"
+    return (
+        req.lora_adapter,
+        req.num_steps,
+        req.cfg_guidance_mode,
+        req.cfg_scale_text,
+        req.cfg_scale_caption,
+        req.cfg_scale_speaker,
+        req.cfg_scale,
+        req.cfg_min_t,
+        req.cfg_max_t,
+        req.truncation_factor,
+        req.rescale_k,
+        req.rescale_sigma,
+        req.context_kv_cache,
+        req.speaker_kv_scale,
+        req.speaker_kv_min_t,
+        req.speaker_kv_max_layers,
+        req.speaker_uncond_mode,
+        req.t_schedule_mode,
+        req.sway_coeff,
+        req.max_text_len,
+        req.max_caption_len,
+        speaker_kind,
+        req.caption is not None and req.caption.strip() != "",
+    )
+
+
+@dataclass
+class _RequestPlan:
+    req: SamplingRequest
+    messages: list[str]
+    stage_timings: list[tuple[str, float]]
+    num_steps: int
+    manual_seconds: float | None
+    duration_scale: float
+    min_seconds: float
+    max_seconds: float
+    num_candidates: int
+    decode_mode: str
+    normalized_text: str
+    text_max_len: int
+    caption_max_len: int
+    has_caption_text: bool
+    truncation_factor: float | None
+    rescale_k: float | None
+    rescale_sigma: float | None
+    speaker_kv_scale: float | None
+    speaker_kv_min_t: float | None
+    speaker_kv_max_layers: int | None
+    cfg_mode: str
+    cfg_scale_text: float
+    cfg_scale_caption: float
+    cfg_scale_speaker: float
+    used_seed: int
+    latent_steps: int = 0
+    target_samples: int = 0
+    patched_steps: int = 0
+
+
+def _right_pad_cat(tensors: list[torch.Tensor | None]) -> torch.Tensor | None:
+    """Right-pad along dim 1 with zeros (False for masks) and concatenate along dim 0."""
+    if tensors[0] is None:
+        return None
+    width = max(t.shape[1] for t in tensors)
+    return torch.cat(
+        [
+            torch.cat([t, t.new_zeros((t.shape[0], width - t.shape[1], *t.shape[2:]))], dim=1)
+            for t in tensors
+        ]
+    )
 
 
 def _maybe_compile_inference_model(
@@ -1031,16 +1113,178 @@ class InferenceRuntime:
         *,
         log_fn: Callable[[str], None] | None = None,
     ) -> SamplingResult:
+        return self.synthesize_batch([req], log_fn=log_fn)[0]
+
+    def synthesize_batch(
+        self,
+        requests: Sequence[SamplingRequest],
+        *,
+        log_fn: Callable[[str], None] | None = None,
+    ) -> list[SamplingResult]:
         def _log(msg: str) -> None:
             if log_fn is not None:
                 log_fn(msg)
 
+        if not requests:
+            raise ValueError("synthesize_batch requires at least one request.")
+        if len(requests) > 1:
+            first_key = batch_compatibility_key(requests[0])
+            for index, req in enumerate(requests):
+                key = batch_compatibility_key(req)
+                if key is None or key != first_key:
+                    raise ValueError(
+                        f"Request {index} cannot share a batch with request 0; "
+                        "see batch_compatibility_key."
+                    )
+
+        plans = [self._plan_request(req, log_fn=_log) for req in requests]
+        post_load_t0 = _measure_start(self.model_device, self.codec_device)
+        lora_messages: list[str] = []
+        lora_timings: list[tuple[str, float]] = []
+
+        with (
+            self._infer_lock,
+            self._prepare_lora_for_request(
+                requests[0].lora_adapter,
+                messages=lora_messages,
+                stage_timings=lora_timings,
+                log_fn=_log,
+            ),
+            torch.inference_mode(),
+        ):
+            for plan in plans:
+                plan.messages.extend(lora_messages)
+                plan.stage_timings.extend(lora_timings)
+            (
+                text_ids,
+                text_mask,
+                caption_ids,
+                caption_mask,
+                speaker_state_override,
+                speaker_mask_override,
+                ref_latent,
+                ref_mask,
+            ) = (
+                _right_pad_cat(list(rows))
+                for rows in zip(
+                    *(self._prepare_request_conditions(plan, log_fn=_log) for plan in plans),
+                    strict=True,
+                )
+            )
+
+            first = plans[0]
+            if len(plans) == 1:
+                batch_kwargs = {"sequence_length": first.patched_steps, "seed": first.used_seed}
+            else:
+                batch_kwargs = {
+                    "sequence_length": max(plan.patched_steps for plan in plans),
+                    "latent_mask": _right_pad_cat(
+                        [
+                            torch.ones(
+                                (plan.num_candidates, plan.patched_steps),
+                                dtype=torch.bool,
+                                device=self.model_device,
+                            )
+                            for plan in plans
+                        ]
+                    ),
+                    "initial_noise": _right_pad_cat(
+                        [
+                            initial_noise(
+                                plan.used_seed,
+                                (
+                                    plan.num_candidates,
+                                    plan.patched_steps,
+                                    self.model_cfg.patched_latent_dim,
+                                ),
+                                device=self.model.device,
+                                dtype=self.model.dtype,
+                            )[0]
+                            for plan in plans
+                        ]
+                    ),
+                }
+
+            t0 = _measure_start(self.model_device)
+            if self.model_cfg.flow_parameterization == "meanflow":
+                z_patched = sample_euler_meanflow(
+                    model=self.model,
+                    text_input_ids=text_ids,
+                    text_mask=text_mask,
+                    ref_latent=ref_latent,
+                    ref_mask=ref_mask,
+                    caption_input_ids=caption_ids,
+                    caption_mask=caption_mask,
+                    speaker_state_override=speaker_state_override,
+                    speaker_mask_override=speaker_mask_override,
+                    speaker_uncond_mode=first.req.speaker_uncond_mode,
+                    num_steps=first.num_steps,
+                    **batch_kwargs,
+                )
+            else:
+                z_patched = sample_euler_rf_cfg(
+                    model=self.model,
+                    text_input_ids=text_ids,
+                    text_mask=text_mask,
+                    ref_latent=ref_latent,
+                    ref_mask=ref_mask,
+                    caption_input_ids=caption_ids,
+                    caption_mask=caption_mask,
+                    speaker_state_override=speaker_state_override,
+                    speaker_mask_override=speaker_mask_override,
+                    speaker_uncond_mode=first.req.speaker_uncond_mode,
+                    num_steps=first.num_steps,
+                    cfg_scale_text=first.cfg_scale_text,
+                    cfg_scale_caption=first.cfg_scale_caption,
+                    cfg_scale_speaker=first.cfg_scale_speaker,
+                    cfg_guidance_mode=first.cfg_mode,
+                    cfg_min_t=float(first.req.cfg_min_t),
+                    cfg_max_t=float(first.req.cfg_max_t),
+                    truncation_factor=first.truncation_factor,
+                    rescale_k=first.rescale_k,
+                    rescale_sigma=first.rescale_sigma,
+                    use_context_kv_cache=bool(first.req.context_kv_cache),
+                    speaker_kv_scale=first.speaker_kv_scale,
+                    speaker_kv_max_layers=first.speaker_kv_max_layers,
+                    speaker_kv_min_t=first.speaker_kv_min_t,
+                    t_schedule_mode=str(first.req.t_schedule_mode),
+                    sway_coeff=float(first.req.sway_coeff),
+                    **batch_kwargs,
+                )
+            stage_sec = _measure_end(self.model_device, t0)
+            sample_stage = (
+                "sample_meanflow"
+                if self.model_cfg.flow_parameterization == "meanflow"
+                else "sample_rf"
+            )
+            for plan in plans:
+                plan.stage_timings.append((sample_stage, stage_sec))
+            _log(f"[runtime] {sample_stage}: {stage_sec * 1000.0:.1f} ms")
+
+            results = [
+                self._finish_request(plan, z_rows, post_load_t0=post_load_t0, log_fn=_log)
+                for plan, z_rows in zip(
+                    plans,
+                    z_patched.split([plan.num_candidates for plan in plans]),
+                    strict=True,
+                )
+            ]
+
+        _log("[runtime] done synthesize")
+        return results
+
+    def _plan_request(
+        self,
+        req: SamplingRequest,
+        *,
+        log_fn: Callable[[str], None],
+    ) -> _RequestPlan:
         messages: list[str] = []
         is_meanflow = self.model_cfg.flow_parameterization == "meanflow"
         num_steps = (4 if is_meanflow else 40) if req.num_steps is None else int(req.num_steps)
         if num_steps <= 0:
             raise ValueError(f"num_steps must be > 0, got {req.num_steps}")
-        _log(
+        log_fn(
             (
                 "[runtime] start synthesize "
                 "model_device={} model_precision={} codec_device={} codec_precision={} "
@@ -1178,312 +1422,311 @@ class InferenceRuntime:
             )
         messages.extend(scale_messages)
         for msg in scale_messages:
-            _log(msg)
+            log_fn(msg)
 
         stage_timings: list[tuple[str, float]] = []
         if req.seed is None:
             used_seed = int(secrets.randbits(63))
             msg = f"info: seed not specified; using random seed {used_seed}."
             messages.append(msg)
-            _log(msg)
+            log_fn(msg)
         else:
             used_seed = int(req.seed)
-            _log(f"[runtime] using seed: {used_seed}")
-        post_load_t0 = _measure_start(self.model_device, self.codec_device)
+            log_fn(f"[runtime] using seed: {used_seed}")
+        return _RequestPlan(
+            req=req,
+            messages=messages,
+            stage_timings=stage_timings,
+            num_steps=num_steps,
+            manual_seconds=manual_seconds,
+            duration_scale=duration_scale,
+            min_seconds=min_seconds,
+            max_seconds=max_seconds,
+            num_candidates=num_candidates,
+            decode_mode=decode_mode,
+            normalized_text=normalized_text,
+            text_max_len=text_max_len,
+            caption_max_len=caption_max_len,
+            has_caption_text=has_caption_text,
+            truncation_factor=truncation_factor,
+            rescale_k=rescale_k,
+            rescale_sigma=rescale_sigma,
+            speaker_kv_scale=speaker_kv_scale,
+            speaker_kv_min_t=speaker_kv_min_t,
+            speaker_kv_max_layers=speaker_kv_max_layers,
+            cfg_mode=cfg_mode,
+            cfg_scale_text=cfg_scale_text,
+            cfg_scale_caption=cfg_scale_caption,
+            cfg_scale_speaker=cfg_scale_speaker,
+            used_seed=used_seed,
+        )
 
-        with (
-            self._infer_lock,
-            self._prepare_lora_for_request(
-                req.lora_adapter,
-                messages=messages,
-                stage_timings=stage_timings,
-                log_fn=_log,
-            ),
-            torch.inference_mode(),
-        ):
-            t0 = _measure_start(self.model_device)
-            text_ids, text_mask = self.tokenizer.batch_encode(
-                [normalized_text] * num_candidates,
-                max_length=text_max_len,
-            )
-            stage_sec = _measure_end(self.model_device, t0)
-            stage_timings.append(("tokenize_text", stage_sec))
-            _log(f"[runtime] tokenize_text: {stage_sec * 1000.0:.1f} ms")
-            text_ids = text_ids.to(self.model_device)
-            text_mask = text_mask.to(self.model_device)
-            caption_ids = None
-            caption_mask = None
-            if self.model_cfg.use_caption_condition:
-                if self.caption_tokenizer is None:
-                    raise RuntimeError(
-                        "Caption conditioning is enabled but caption tokenizer is not loaded."
-                    )
-                caption_text = "" if req.caption is None else str(req.caption).strip()
-                caption_ids, caption_mask = self.caption_tokenizer.batch_encode(
-                    [caption_text] * num_candidates,
-                    max_length=caption_max_len,
+    def _prepare_request_conditions(
+        self,
+        plan: _RequestPlan,
+        *,
+        log_fn: Callable[[str], None],
+    ) -> tuple[torch.Tensor | None, ...]:
+        req = plan.req
+        messages = plan.messages
+        stage_timings = plan.stage_timings
+        num_candidates = plan.num_candidates
+        normalized_text = plan.normalized_text
+        text_max_len = plan.text_max_len
+        caption_max_len = plan.caption_max_len
+        manual_seconds = plan.manual_seconds
+        min_seconds = plan.min_seconds
+        max_seconds = plan.max_seconds
+        duration_scale = plan.duration_scale
+        has_caption_text = plan.has_caption_text
+        t0 = _measure_start(self.model_device)
+        text_ids, text_mask = self.tokenizer.batch_encode(
+            [normalized_text] * num_candidates,
+            max_length=text_max_len,
+        )
+        stage_sec = _measure_end(self.model_device, t0)
+        stage_timings.append(("tokenize_text", stage_sec))
+        log_fn(f"[runtime] tokenize_text: {stage_sec * 1000.0:.1f} ms")
+        text_ids = text_ids.to(self.model_device)
+        text_mask = text_mask.to(self.model_device)
+        caption_ids = None
+        caption_mask = None
+        if self.model_cfg.use_caption_condition:
+            if self.caption_tokenizer is None:
+                raise RuntimeError(
+                    "Caption conditioning is enabled but caption tokenizer is not loaded."
                 )
-                if caption_text == "":
-                    caption_mask.zero_()
-                caption_ids = caption_ids.to(self.model_device)
-                caption_mask = caption_mask.to(self.model_device)
+            caption_text = "" if req.caption is None else str(req.caption).strip()
+            caption_ids, caption_mask = self.caption_tokenizer.batch_encode(
+                [caption_text] * num_candidates,
+                max_length=caption_max_len,
+            )
+            if caption_text == "":
+                caption_mask.zero_()
+            caption_ids = caption_ids.to(self.model_device)
+            caption_mask = caption_mask.to(self.model_device)
 
-            t0 = _measure_start(self.model_device, self.codec_device)
-            msg_count_before_ref = len(messages)
-            (
-                speaker_state_override,
-                speaker_mask_override,
-            ) = self._load_speaker_embedding_condition(
+        t0 = _measure_start(self.model_device, self.codec_device)
+        msg_count_before_ref = len(messages)
+        (
+            speaker_state_override,
+            speaker_mask_override,
+        ) = self._load_speaker_embedding_condition(
+            req=req,
+            batch_size=num_candidates,
+            messages=messages,
+        )
+        if speaker_state_override is None:
+            ref_latent, ref_mask = self._load_reference_latent(
                 req=req,
                 batch_size=num_candidates,
                 messages=messages,
             )
-            if speaker_state_override is None:
-                ref_latent, ref_mask = self._load_reference_latent(
-                    req=req,
-                    batch_size=num_candidates,
-                    messages=messages,
-                )
-            else:
-                ref_latent, ref_mask = None, None
-            stage_sec = _measure_end(self.model_device, t0, self.codec_device)
-            stage_timings.append(("prepare_reference", stage_sec))
-            for msg in messages[msg_count_before_ref:]:
-                _log(msg)
-            _log(f"[runtime] prepare_reference: {stage_sec * 1000.0:.1f} ms")
+        else:
+            ref_latent, ref_mask = None, None
+        stage_sec = _measure_end(self.model_device, t0, self.codec_device)
+        stage_timings.append(("prepare_reference", stage_sec))
+        for msg in messages[msg_count_before_ref:]:
+            log_fn(msg)
+        log_fn(f"[runtime] prepare_reference: {stage_sec * 1000.0:.1f} ms")
 
-            hop_length = int(self.codec.model.hop_length)
-            if manual_seconds is not None:
-                clamped_seconds = min(max_seconds, max(min_seconds, manual_seconds))
-                if clamped_seconds != manual_seconds:
-                    duration_msg = (
-                        f"warning: manual duration {manual_seconds:.3f}s was clamped to "
-                        f"{clamped_seconds:.3f}s."
-                    )
-                    messages.append(duration_msg)
-                    _log(duration_msg)
-                target_samples = max(1, int(clamped_seconds * self.codec.sample_rate))
-                latent_steps = math.ceil(target_samples / hop_length)
-                duration_msg = f"info: using manual duration {clamped_seconds:.3f}s."
+        hop_length = int(self.codec.model.hop_length)
+        if manual_seconds is not None:
+            clamped_seconds = min(max_seconds, max(min_seconds, manual_seconds))
+            if clamped_seconds != manual_seconds:
+                duration_msg = (
+                    f"warning: manual duration {manual_seconds:.3f}s was clamped to "
+                    f"{clamped_seconds:.3f}s."
+                )
                 messages.append(duration_msg)
-                _log(duration_msg)
-            elif self.model_cfg.use_duration_predictor:
-                t0 = _measure_start(self.model_device)
-                has_speaker_duration = torch.zeros(
-                    (num_candidates,), dtype=torch.bool, device=self.model_device
-                )
-                if speaker_mask_override is not None:
-                    has_speaker_duration = speaker_mask_override.any(dim=1)
-                elif self.model_cfg.use_speaker_condition_resolved and ref_mask is not None:
-                    has_speaker_duration = ref_mask.any(dim=1)
-                duration_features = build_duration_features(
-                    [normalized_text] * num_candidates,
-                    token_counts=text_mask.sum(dim=1),
-                    max_text_len=text_max_len,
-                    has_speaker=has_speaker_duration,
-                ).to(self.model_device)
-                (
-                    duration_text_state,
-                    duration_text_mask,
-                    duration_speaker_state,
-                    _duration_speaker_mask,
-                    _duration_caption_state,
-                    _duration_caption_mask,
-                ) = self.model.encode_conditions(
-                    text_input_ids=text_ids,
-                    text_mask=text_mask,
-                    ref_latent=ref_latent,
-                    ref_mask=ref_mask,
-                    caption_input_ids=caption_ids,
-                    caption_mask=caption_mask,
-                    speaker_state_override=speaker_state_override,
-                    speaker_mask_override=speaker_mask_override,
-                    speaker_uncond_mode=req.speaker_uncond_mode,
-                )
-                pred_log_frames = self.model.predict_duration_log_frames(
-                    text_state=duration_text_state,
-                    text_mask=duration_text_mask,
-                    speaker_state=duration_speaker_state,
-                    speaker_mask=_duration_speaker_mask,
-                    caption_state=_duration_caption_state,
-                    caption_mask=_duration_caption_mask,
-                    duration_features=duration_features,
-                    has_speaker=has_speaker_duration,
-                    has_caption=torch.full(
-                        (num_candidates,),
-                        has_caption_text,
-                        dtype=torch.bool,
-                        device=self.model_device,
-                    )
-                    if self.model_cfg.use_caption_condition
-                    else None,
-                )
-                pred_frames = torch.expm1(pred_log_frames).float().mean().item()
-                scaled_frames = pred_frames * duration_scale
-                min_frames = max(1, math.ceil(min_seconds * self.codec.sample_rate / hop_length))
-                max_frames = max(1, math.floor(max_seconds * self.codec.sample_rate / hop_length))
-                latent_steps = int(round(scaled_frames))
-                latent_steps = max(min_frames, min(max_frames, latent_steps))
-                target_samples = int(latent_steps * hop_length)
-                stage_sec = _measure_end(self.model_device, t0)
-                stage_timings.append(("predict_duration", stage_sec))
-                msg = (
-                    f"info: predicted duration frames={pred_frames:.1f}, "
-                    f"scale={duration_scale:.3f}, using_frames={latent_steps} "
-                    f"({target_samples / float(self.codec.sample_rate):.3f}s)."
-                )
-                messages.append(msg)
-                _log(msg)
-                _log(f"[runtime] predict_duration: {stage_sec * 1000.0:.1f} ms")
-            else:
-                fallback_seconds = 30.0
-                target_samples = int(fallback_seconds * self.codec.sample_rate)
-                latent_steps = math.ceil(target_samples / hop_length)
-                msg = "info: checkpoint has no duration predictor; falling back to 30.000s."
-                messages.append(msg)
-                _log(msg)
-            patched_steps = math.ceil(latent_steps / self.model_cfg.latent_patch_size)
-
-            if isinstance(self.train_cfg, dict):
-                fixed_steps = self.train_cfg.get("fixed_target_latent_steps")
-                if isinstance(fixed_steps, int) and fixed_steps > 0 and latent_steps > fixed_steps:
-                    msg = (
-                        f"warning: requested latent length ({latent_steps}) exceeds fixed_target_latent_steps ({fixed_steps}) "
-                        "used in training. Long-tail stability may degrade."
-                    )
-                    messages.append(msg)
-                    _log(msg)
-
+                log_fn(duration_msg)
+            target_samples = max(1, int(clamped_seconds * self.codec.sample_rate))
+            latent_steps = math.ceil(target_samples / hop_length)
+            duration_msg = f"info: using manual duration {clamped_seconds:.3f}s."
+            messages.append(duration_msg)
+            log_fn(duration_msg)
+        elif self.model_cfg.use_duration_predictor:
             t0 = _measure_start(self.model_device)
-            if self.model_cfg.flow_parameterization == "meanflow":
-                z_patched = sample_euler_meanflow(
-                    model=self.model,
-                    text_input_ids=text_ids,
-                    text_mask=text_mask,
-                    ref_latent=ref_latent,
-                    ref_mask=ref_mask,
-                    sequence_length=patched_steps,
-                    caption_input_ids=caption_ids,
-                    caption_mask=caption_mask,
-                    speaker_state_override=speaker_state_override,
-                    speaker_mask_override=speaker_mask_override,
-                    speaker_uncond_mode=req.speaker_uncond_mode,
-                    num_steps=num_steps,
-                    seed=used_seed,
-                )
-            else:
-                z_patched = sample_euler_rf_cfg(
-                    model=self.model,
-                    text_input_ids=text_ids,
-                    text_mask=text_mask,
-                    ref_latent=ref_latent,
-                    ref_mask=ref_mask,
-                    sequence_length=patched_steps,
-                    caption_input_ids=caption_ids,
-                    caption_mask=caption_mask,
-                    speaker_state_override=speaker_state_override,
-                    speaker_mask_override=speaker_mask_override,
-                    speaker_uncond_mode=req.speaker_uncond_mode,
-                    num_steps=num_steps,
-                    cfg_scale_text=cfg_scale_text,
-                    cfg_scale_caption=cfg_scale_caption,
-                    cfg_scale_speaker=cfg_scale_speaker,
-                    cfg_guidance_mode=cfg_mode,
-                    cfg_min_t=float(req.cfg_min_t),
-                    cfg_max_t=float(req.cfg_max_t),
-                    seed=used_seed,
-                    truncation_factor=truncation_factor,
-                    rescale_k=rescale_k,
-                    rescale_sigma=rescale_sigma,
-                    use_context_kv_cache=bool(req.context_kv_cache),
-                    speaker_kv_scale=speaker_kv_scale,
-                    speaker_kv_max_layers=speaker_kv_max_layers,
-                    speaker_kv_min_t=speaker_kv_min_t,
-                    t_schedule_mode=str(req.t_schedule_mode),
-                    sway_coeff=float(req.sway_coeff),
-                )
-            stage_sec = _measure_end(self.model_device, t0)
-            sample_stage = (
-                "sample_meanflow"
-                if self.model_cfg.flow_parameterization == "meanflow"
-                else "sample_rf"
+            has_speaker_duration = torch.zeros(
+                (num_candidates,), dtype=torch.bool, device=self.model_device
             )
-            stage_timings.append((sample_stage, stage_sec))
-            _log(f"[runtime] {sample_stage}: {stage_sec * 1000.0:.1f} ms")
-
-            t0 = _measure_start(self.model_device)
-            z = unpatchify_latent(
-                z_patched,
-                patch_size=self.model_cfg.latent_patch_size,
-                latent_dim=self.model_cfg.latent_dim,
+            if speaker_mask_override is not None:
+                has_speaker_duration = speaker_mask_override.any(dim=1)
+            elif self.model_cfg.use_speaker_condition_resolved and ref_mask is not None:
+                has_speaker_duration = ref_mask.any(dim=1)
+            duration_features = build_duration_features(
+                [normalized_text] * num_candidates,
+                token_counts=text_mask.sum(dim=1),
+                max_text_len=text_max_len,
+                has_speaker=has_speaker_duration,
+            ).to(self.model_device)
+            (
+                duration_text_state,
+                duration_text_mask,
+                duration_speaker_state,
+                _duration_speaker_mask,
+                _duration_caption_state,
+                _duration_caption_mask,
+            ) = self.model.encode_conditions(
+                text_input_ids=text_ids,
+                text_mask=text_mask,
+                ref_latent=ref_latent,
+                ref_mask=ref_mask,
+                caption_input_ids=caption_ids,
+                caption_mask=caption_mask,
+                speaker_state_override=speaker_state_override,
+                speaker_mask_override=speaker_mask_override,
+                speaker_uncond_mode=req.speaker_uncond_mode,
             )
-            stage_sec = _measure_end(self.model_device, t0)
-            stage_timings.append(("unpatchify_latent", stage_sec))
-            _log(f"[runtime] unpatchify_latent: {stage_sec * 1000.0:.1f} ms")
-            z = z[:, :latent_steps]
-
-            t0 = _measure_start(self.model_device, self.codec_device)
-            trimmed_audios: list[torch.Tensor] = []
-            if decode_mode == "batch":
-                audio_batch = self.codec.decode_latent(z).cpu()
-                for i in range(num_candidates):
-                    audio_i = audio_batch[i]
-                    max_samples = target_samples
-                    if bool(req.trim_tail):
-                        flattening_point = find_flattening_point(
-                            z[i],
-                            window_size=max(1, int(req.tail_window_size)),
-                            std_threshold=float(req.tail_std_threshold),
-                            mean_threshold=float(req.tail_mean_threshold),
-                        )
-                        flattening_samples = int(
-                            flattening_point * int(self.codec.model.hop_length)
-                        )
-                        if flattening_samples > 0:
-                            max_samples = min(max_samples, flattening_samples)
-                    trimmed_audios.append(audio_i[:, :max_samples])
-            else:
-                for i in range(num_candidates):
-                    audio_i = self.codec.decode_latent(z[i : i + 1]).cpu()[0]
-                    max_samples = target_samples
-                    if bool(req.trim_tail):
-                        flattening_point = find_flattening_point(
-                            z[i],
-                            window_size=max(1, int(req.tail_window_size)),
-                            std_threshold=float(req.tail_std_threshold),
-                            mean_threshold=float(req.tail_mean_threshold),
-                        )
-                        flattening_samples = int(
-                            flattening_point * int(self.codec.model.hop_length)
-                        )
-                        if flattening_samples > 0:
-                            max_samples = min(max_samples, flattening_samples)
-                    trimmed_audios.append(audio_i[:, :max_samples])
-            stage_sec = _measure_end(self.model_device, t0, self.codec_device)
-            stage_timings.append(("decode_latent", stage_sec))
-            _log(f"[runtime] decode_latent ({decode_mode}): {stage_sec * 1000.0:.1f} ms")
-
-            if self.watermarker.ready:
-                t0 = _measure_start(self.codec_device)
-                trimmed_audios = self.watermarker.encode_batch(
-                    trimmed_audios,
-                    sample_rate=int(self.codec.sample_rate),
+            pred_log_frames = self.model.predict_duration_log_frames(
+                text_state=duration_text_state,
+                text_mask=duration_text_mask,
+                speaker_state=duration_speaker_state,
+                speaker_mask=_duration_speaker_mask,
+                caption_state=_duration_caption_state,
+                caption_mask=_duration_caption_mask,
+                duration_features=duration_features,
+                has_speaker=has_speaker_duration,
+                has_caption=torch.full(
+                    (num_candidates,),
+                    has_caption_text,
+                    dtype=torch.bool,
+                    device=self.model_device,
                 )
-                stage_sec = _measure_end(self.codec_device, t0)
-                stage_timings.append(("silentcipher_watermark", stage_sec))
-                _log(f"[runtime] silentcipher_watermark: {stage_sec * 1000.0:.1f} ms")
-            else:
+                if self.model_cfg.use_caption_condition
+                else None,
+            )
+            pred_frames = torch.expm1(pred_log_frames).float().mean().item()
+            scaled_frames = pred_frames * duration_scale
+            min_frames = max(1, math.ceil(min_seconds * self.codec.sample_rate / hop_length))
+            max_frames = max(1, math.floor(max_seconds * self.codec.sample_rate / hop_length))
+            latent_steps = int(round(scaled_frames))
+            latent_steps = max(min_frames, min(max_frames, latent_steps))
+            target_samples = int(latent_steps * hop_length)
+            stage_sec = _measure_end(self.model_device, t0)
+            stage_timings.append(("predict_duration", stage_sec))
+            msg = (
+                f"info: predicted duration frames={pred_frames:.1f}, "
+                f"scale={duration_scale:.3f}, using_frames={latent_steps} "
+                f"({target_samples / float(self.codec.sample_rate):.3f}s)."
+            )
+            messages.append(msg)
+            log_fn(msg)
+            log_fn(f"[runtime] predict_duration: {stage_sec * 1000.0:.1f} ms")
+        else:
+            fallback_seconds = 30.0
+            target_samples = int(fallback_seconds * self.codec.sample_rate)
+            latent_steps = math.ceil(target_samples / hop_length)
+            msg = "info: checkpoint has no duration predictor; falling back to 30.000s."
+            messages.append(msg)
+            log_fn(msg)
+        plan.latent_steps = latent_steps
+        plan.target_samples = target_samples
+        plan.patched_steps = math.ceil(latent_steps / self.model_cfg.latent_patch_size)
+
+        if isinstance(self.train_cfg, dict):
+            fixed_steps = self.train_cfg.get("fixed_target_latent_steps")
+            if isinstance(fixed_steps, int) and fixed_steps > 0 and latent_steps > fixed_steps:
                 msg = (
-                    "warning: SilentCipher watermark is unavailable; generated audio was not "
-                    "watermarked."
+                    f"warning: requested latent length ({latent_steps}) exceeds fixed_target_latent_steps ({fixed_steps}) "
+                    "used in training. Long-tail stability may degrade."
                 )
                 messages.append(msg)
-                _log(msg)
+                log_fn(msg)
+        return (
+            text_ids,
+            text_mask,
+            caption_ids,
+            caption_mask,
+            speaker_state_override,
+            speaker_mask_override,
+            ref_latent,
+            ref_mask,
+        )
 
-            total_to_decode = _measure_end(self.model_device, post_load_t0, self.codec_device)
-            _log(f"[runtime] total_to_decode: {total_to_decode:.3f} s")
+    def _finish_request(
+        self,
+        plan: _RequestPlan,
+        z_patched: torch.Tensor,
+        *,
+        post_load_t0: float,
+        log_fn: Callable[[str], None],
+    ) -> SamplingResult:
+        req = plan.req
+        messages = plan.messages
+        stage_timings = plan.stage_timings
+        num_candidates = plan.num_candidates
+        decode_mode = plan.decode_mode
+        latent_steps = plan.latent_steps
+        target_samples = plan.target_samples
+        used_seed = plan.used_seed
+        t0 = _measure_start(self.model_device)
+        z = unpatchify_latent(
+            z_patched,
+            patch_size=self.model_cfg.latent_patch_size,
+            latent_dim=self.model_cfg.latent_dim,
+        )
+        stage_sec = _measure_end(self.model_device, t0)
+        stage_timings.append(("unpatchify_latent", stage_sec))
+        log_fn(f"[runtime] unpatchify_latent: {stage_sec * 1000.0:.1f} ms")
+        z = z[:, :latent_steps]
 
-        _log("[runtime] done synthesize")
+        t0 = _measure_start(self.model_device, self.codec_device)
+        trimmed_audios: list[torch.Tensor] = []
+        if decode_mode == "batch":
+            audio_batch = self.codec.decode_latent(z).cpu()
+            for i in range(num_candidates):
+                audio_i = audio_batch[i]
+                max_samples = target_samples
+                if bool(req.trim_tail):
+                    flattening_point = find_flattening_point(
+                        z[i],
+                        window_size=max(1, int(req.tail_window_size)),
+                        std_threshold=float(req.tail_std_threshold),
+                        mean_threshold=float(req.tail_mean_threshold),
+                    )
+                    flattening_samples = int(flattening_point * int(self.codec.model.hop_length))
+                    if flattening_samples > 0:
+                        max_samples = min(max_samples, flattening_samples)
+                trimmed_audios.append(audio_i[:, :max_samples])
+        else:
+            for i in range(num_candidates):
+                audio_i = self.codec.decode_latent(z[i : i + 1]).cpu()[0]
+                max_samples = target_samples
+                if bool(req.trim_tail):
+                    flattening_point = find_flattening_point(
+                        z[i],
+                        window_size=max(1, int(req.tail_window_size)),
+                        std_threshold=float(req.tail_std_threshold),
+                        mean_threshold=float(req.tail_mean_threshold),
+                    )
+                    flattening_samples = int(flattening_point * int(self.codec.model.hop_length))
+                    if flattening_samples > 0:
+                        max_samples = min(max_samples, flattening_samples)
+                trimmed_audios.append(audio_i[:, :max_samples])
+        stage_sec = _measure_end(self.model_device, t0, self.codec_device)
+        stage_timings.append(("decode_latent", stage_sec))
+        log_fn(f"[runtime] decode_latent ({decode_mode}): {stage_sec * 1000.0:.1f} ms")
+
+        if self.watermarker.ready:
+            t0 = _measure_start(self.codec_device)
+            trimmed_audios = self.watermarker.encode_batch(
+                trimmed_audios,
+                sample_rate=int(self.codec.sample_rate),
+            )
+            stage_sec = _measure_end(self.codec_device, t0)
+            stage_timings.append(("silentcipher_watermark", stage_sec))
+            log_fn(f"[runtime] silentcipher_watermark: {stage_sec * 1000.0:.1f} ms")
+        else:
+            msg = (
+                "warning: SilentCipher watermark is unavailable; generated audio was not "
+                "watermarked."
+            )
+            messages.append(msg)
+            log_fn(msg)
+
+        total_to_decode = _measure_end(self.model_device, post_load_t0, self.codec_device)
+        log_fn(f"[runtime] total_to_decode: {total_to_decode:.3f} s")
         return SamplingResult(
             audio=trimmed_audios[0],
             audios=trimmed_audios,
