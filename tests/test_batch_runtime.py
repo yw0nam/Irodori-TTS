@@ -37,31 +37,45 @@ class FakeCodec:
 
 
 @pytest.fixture
-def runtime(tiny_model, monkeypatch) -> InferenceRuntime:
+def make_runtime(tiny_model, monkeypatch):
     # Keep the test offline: the watermarker reports not-ready instead of loading SilentCipher.
     monkeypatch.setattr(SilentCipherWatermarker, "_load_backend", staticmethod(lambda **_: None))
-    model = tiny_model()
-    return InferenceRuntime(
-        key=RuntimeKey(checkpoint="tiny", model_device="cpu"),
-        model_cfg=model.cfg,
-        train_cfg=None,
-        model=model,
-        tokenizer=FakeTokenizer(),
-        caption_tokenizer=None,
-        codec=FakeCodec(),
-        default_text_max_len=16,
-        default_caption_max_len=16,
-    )
+
+    def make(**model_overrides) -> InferenceRuntime:
+        model = tiny_model(**model_overrides)
+        return InferenceRuntime(
+            key=RuntimeKey(checkpoint="tiny", model_device="cpu"),
+            model_cfg=model.cfg,
+            train_cfg=None,
+            model=model,
+            tokenizer=FakeTokenizer(),
+            caption_tokenizer=None,
+            codec=FakeCodec(),
+            default_text_max_len=16,
+            default_caption_max_len=16,
+        )
+
+    return make
+
+
+@pytest.fixture
+def runtime(make_runtime) -> InferenceRuntime:
+    return make_runtime()
+
+
+def write_ref_latents(runtime: InferenceRuntime, tmp_path, lengths: list[int]) -> list[str]:
+    gen = torch.Generator().manual_seed(3)
+    paths = []
+    for index, steps in enumerate(lengths):
+        path = tmp_path / f"ref{index}.pt"
+        torch.save(torch.randn((steps, runtime.model_cfg.latent_dim), generator=gen), path)
+        paths.append(str(path))
+    return paths
 
 
 @pytest.fixture
 def two_requests(runtime, tmp_path) -> list[SamplingRequest]:
-    gen = torch.Generator().manual_seed(3)
-    paths = []
-    for name, steps in (("short", 6), ("long", 11)):
-        path = tmp_path / f"{name}.pt"
-        torch.save(torch.randn((steps, runtime.model_cfg.latent_dim), generator=gen), path)
-        paths.append(str(path))
+    paths = write_ref_latents(runtime, tmp_path, [6, 11])
     # 0.5 s and 0.9 s at 80 Hz / hop 8 give 5 and 9 latent steps.
     return [
         SamplingRequest(
@@ -88,6 +102,18 @@ def test_synthesize_batch_matches_single_requests(runtime, two_requests) -> None
 def test_synthesize_batch_rejects_incompatible_requests(runtime, two_requests) -> None:
     with pytest.raises(ValueError, match=r"Request 1 cannot share"):
         runtime.synthesize_batch([two_requests[0], replace(two_requests[1], num_steps=8)])
+
+
+def test_synthesize_batch_rejects_reference_shorter_than_speaker_patch(
+    make_runtime, tmp_path
+) -> None:
+    runtime = make_runtime(speaker_patch_size=4)
+    requests = [
+        SamplingRequest(text="hi", ref_latent=path, seconds=0.5, seed=1, num_steps=4)
+        for path in write_ref_latents(runtime, tmp_path, [2, 13])
+    ]
+    with pytest.raises(ValueError, match="Reference sequence too short for speaker_patch_size"):
+        runtime.synthesize_batch(requests)
 
 
 def test_batch_compatibility_key() -> None:

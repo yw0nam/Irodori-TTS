@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -7,7 +9,7 @@ from irodori_tts.config import ModelConfig
 from irodori_tts.model import TextToLatentRFDiT
 
 
-def _build_tiny_model(flow_parameterization: str = "rf_velocity") -> TextToLatentRFDiT:
+def _build_tiny_model(flow_parameterization: str = "rf_velocity", **overrides) -> TextToLatentRFDiT:
     cfg = ModelConfig(
         flow_parameterization=flow_parameterization,
         latent_dim=4,
@@ -29,7 +31,7 @@ def _build_tiny_model(flow_parameterization: str = "rf_velocity") -> TextToLaten
         adaln_rank=8,
     )
     torch.manual_seed(0)
-    model = TextToLatentRFDiT(cfg)
+    model = TextToLatentRFDiT(replace(cfg, **overrides))
     # The model zero-initializes its output and gate projections; non-zero weights make leaks visible.
     for param in model.parameters():
         torch.nn.init.normal_(param, std=0.2)
