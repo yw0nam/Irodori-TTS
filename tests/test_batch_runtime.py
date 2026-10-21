@@ -86,7 +86,7 @@ def test_synthesize_batch_matches_single_requests(runtime, two_requests) -> None
 
 
 def test_synthesize_batch_rejects_incompatible_requests(runtime, two_requests) -> None:
-    with pytest.raises(ValueError, match="1"):
+    with pytest.raises(ValueError, match=r"Request 1 cannot share"):
         runtime.synthesize_batch([two_requests[0], replace(two_requests[1], num_steps=8)])
 
 

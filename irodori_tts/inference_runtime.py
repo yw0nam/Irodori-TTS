@@ -1129,9 +1129,10 @@ class InferenceRuntime:
             raise ValueError("synthesize_batch requires at least one request.")
         if len(requests) > 1:
             first_key = batch_compatibility_key(requests[0])
-            for index, req in enumerate(requests):
-                key = batch_compatibility_key(req)
-                if key is None or key != first_key:
+            if first_key is None:
+                raise ValueError("Request 0 cannot run in a batch; see batch_compatibility_key.")
+            for index, req in enumerate(requests[1:], start=1):
+                if batch_compatibility_key(req) != first_key:
                     raise ValueError(
                         f"Request {index} cannot share a batch with request 0; "
                         "see batch_compatibility_key."
