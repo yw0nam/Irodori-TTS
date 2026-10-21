@@ -30,7 +30,7 @@ def _build_tiny_model(flow_parameterization: str = "rf_velocity") -> TextToLaten
     )
     torch.manual_seed(0)
     model = TextToLatentRFDiT(cfg)
-    # The model zero-initialises its output and gate projections; non-zero weights make leaks visible.
+    # The model zero-initializes its output and gate projections; non-zero weights make leaks visible.
     for param in model.parameters():
         torch.nn.init.normal_(param, std=0.2)
     return model.eval()

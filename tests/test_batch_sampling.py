@@ -90,14 +90,19 @@ def assert_rows_match_singles(singles, steps, batched, unmasked) -> None:
         torch.testing.assert_close(unmasked[0:1, : steps[0]], singles[0])
 
 
-def test_rf_batch_rows_match_single_runs(tiny_model) -> None:
+@pytest.mark.parametrize(
+    ("cfg_guidance_mode", "cfg_scale_speaker"),
+    # Joint guidance requires equal enabled scales.
+    [("independent", 5.0), ("joint", 3.0), ("alternating", 5.0)],
+)
+def test_rf_batch_rows_match_single_runs(tiny_model, cfg_guidance_mode, cfg_scale_speaker) -> None:
     results = run_single_and_batched(
         tiny_model(),
         sample_euler_rf_cfg,
         num_steps=6,
         cfg_scale_text=3.0,
-        cfg_scale_speaker=5.0,
-        cfg_guidance_mode="independent",
+        cfg_scale_speaker=cfg_scale_speaker,
+        cfg_guidance_mode=cfg_guidance_mode,
     )
     assert_rows_match_singles(*results)
 
