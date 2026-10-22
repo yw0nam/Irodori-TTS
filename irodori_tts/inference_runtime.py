@@ -1648,6 +1648,9 @@ class InferenceRuntime:
             )
             plan_log_frames = pred_log_frames.split([plan.num_candidates for plan in plans])
             stage_sec = _measure_end(self.model_device, t0)
+            for plan in plans:
+                if plan.manual_seconds is None:
+                    plan.stage_timings.append(("predict_duration", stage_sec))
             log_fn(f"[runtime] predict_duration: {stage_sec * 1000.0:.1f} ms")
 
         for plan, log_frames in zip(plans, plan_log_frames, strict=True):
@@ -1677,7 +1680,6 @@ class InferenceRuntime:
                 latent_steps = int(round(scaled_frames))
                 latent_steps = max(min_frames, min(max_frames, latent_steps))
                 target_samples = int(latent_steps * hop_length)
-                plan.stage_timings.append(("predict_duration", stage_sec))
                 msg = (
                     f"info: predicted duration frames={pred_frames:.1f}, "
                     f"scale={plan.duration_scale:.3f}, using_frames={latent_steps} "

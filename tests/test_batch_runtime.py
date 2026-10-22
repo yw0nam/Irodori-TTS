@@ -178,7 +178,7 @@ def duration_runtime(make_runtime) -> InferenceRuntime:
     return make_runtime(use_duration_predictor=True)
 
 
-def count_duration_calls(runtime: InferenceRuntime) -> list[int]:
+def record_duration_batch_sizes(runtime: InferenceRuntime) -> list[int]:
     calls = []
     predict = runtime.model.predict_duration_log_frames
 
@@ -214,7 +214,7 @@ def test_synthesize_batch_predicts_durations_in_one_call(duration_runtime, tmp_p
         max_seconds=1.0,
         trim_tail=False,
     )
-    calls = count_duration_calls(duration_runtime)
+    calls = record_duration_batch_sizes(duration_runtime)
 
     batched = duration_runtime.synthesize_batch([a, b])
 
