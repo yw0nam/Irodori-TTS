@@ -16,6 +16,18 @@ For an OpenAI-compatible inference API server, see [Irodori-TTS-Server](https://
 
 For model weights and audio samples, please refer to the [Irodori-TTS-v4.1-Small model card](https://huggingface.co/Aratako/Irodori-TTS-v4.1-Small).
 
+## Fork changes
+
+This fork ([yw0nam/Irodori-TTS](https://github.com/yw0nam/Irodori-TTS)) adds inference changes for serving many requests, used by [yw0nam/Irodori-TTS-Server](https://github.com/yw0nam/Irodori-TTS-Server). Training code and checkpoints are unchanged.
+
+| Area | Upstream | This fork |
+|---|---|---|
+| Batch inference | `InferenceRuntime.synthesize(req)` runs one request | `synthesize_batch(requests)` runs requests with different texts, lengths and reference voices in one call: right-padded latents with a `latent_mask`, per-request seeds. `batch_compatibility_key(req)` tells which requests can share a batch. `synthesize(req)` is `synthesize_batch([req])[0]` |
+| Reference voices | Reference audio is read and encoded on every request | The encoded reference latent is cached per runtime (32 entries, keyed by path, mtime, size and loading options) |
+| Masked attention (CUDA) | cuDNN first; it builds a new execution plan for each new input length | `IRODORI_SDPA_CUDNN=0` skips cuDNN (see [docs/parameters.md](docs/parameters.md)) |
+
+On one L40S with v4.1-Small in bf16, the server with these changes went from 0.22 to 1.95 requests per second at 16 concurrent requests; the full table is in the [server README](https://github.com/yw0nam/Irodori-TTS-Server#fork-changes).
+
 ## Features
 
 - **Flow Matching TTS**: Rectified Flow Diffusion Transformer (RF-DiT) over continuous DACVAE latents
