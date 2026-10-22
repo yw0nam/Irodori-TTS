@@ -50,8 +50,7 @@ def _fa3_disabled() -> bool:
 
 
 def _sdpa_priority() -> list[SDPBackend]:
-    # cuDNN builds an execution plan for each new shape, which dominates inference
-    # with varying text and audio lengths.
+    # cuDNN builds an execution plan per new shape, which dominates variable-length inference.
     if os.environ.get("IRODORI_SDPA_CUDNN", "").strip() == "0":
         return _SDPA_PRIORITY[1:]
     return _SDPA_PRIORITY
@@ -141,7 +140,7 @@ def masked_sdpa(
     v: torch.Tensor,
     attn_mask: torch.Tensor | None,
 ) -> torch.Tensor:
-    """SDPA in (B, S, H, D) layout with the cuDNN-first backend priority."""
+    """SDPA in (B, S, H, D) layout with the masked-attention backend priority."""
     if attn_mask is None or not q.is_cuda:
         return _sdpa(q, k, v, attn_mask)
     with sdpa_kernel(_sdpa_priority(), set_priority=True):
