@@ -1184,6 +1184,14 @@ class InferenceRuntime:
             for plan in plans:
                 plan.messages.extend(lora_messages)
                 plan.stage_timings.extend(lora_timings)
+            conditions = tuple(
+                _right_pad_cat(list(rows))
+                for rows in zip(
+                    *(self._prepare_request_conditions(plan, log_fn=_log) for plan in plans),
+                    strict=True,
+                )
+            )
+            self._plan_latent_steps(plans, conditions, log_fn=_log)
             (
                 text_ids,
                 text_mask,
@@ -1193,13 +1201,7 @@ class InferenceRuntime:
                 speaker_mask_override,
                 ref_latent,
                 ref_mask,
-            ) = (
-                _right_pad_cat(list(rows))
-                for rows in zip(
-                    *(self._prepare_request_conditions(plan, log_fn=_log) for plan in plans),
-                    strict=True,
-                )
-            )
+            ) = conditions
 
             first = plans[0]
             if len(plans) == 1:
@@ -1503,11 +1505,6 @@ class InferenceRuntime:
         normalized_text = plan.normalized_text
         text_max_len = plan.text_max_len
         caption_max_len = plan.caption_max_len
-        manual_seconds = plan.manual_seconds
-        min_seconds = plan.min_seconds
-        max_seconds = plan.max_seconds
-        duration_scale = plan.duration_scale
-        has_caption_text = plan.has_caption_text
         t0 = _measure_start(self.model_device)
         text_ids, text_mask = self.tokenizer.batch_encode(
             [normalized_text] * num_candidates,
@@ -1567,34 +1564,51 @@ class InferenceRuntime:
             log_fn(msg)
         log_fn(f"[runtime] prepare_reference: {stage_sec * 1000.0:.1f} ms")
 
+        return (
+            text_ids,
+            text_mask,
+            caption_ids,
+            caption_mask,
+            speaker_state_override,
+            speaker_mask_override,
+            ref_latent,
+            ref_mask,
+        )
+
+    def _plan_latent_steps(
+        self,
+        plans: list[_RequestPlan],
+        conditions: tuple[torch.Tensor | None, ...],
+        *,
+        log_fn: Callable[[str], None],
+    ) -> None:
         hop_length = int(self.codec.model.hop_length)
-        if manual_seconds is not None:
-            clamped_seconds = min(max_seconds, max(min_seconds, manual_seconds))
-            if clamped_seconds != manual_seconds:
-                duration_msg = (
-                    f"warning: manual duration {manual_seconds:.3f}s was clamped to "
-                    f"{clamped_seconds:.3f}s."
-                )
-                messages.append(duration_msg)
-                log_fn(duration_msg)
-            target_samples = max(1, int(clamped_seconds * self.codec.sample_rate))
-            latent_steps = math.ceil(target_samples / hop_length)
-            duration_msg = f"info: using manual duration {clamped_seconds:.3f}s."
-            messages.append(duration_msg)
-            log_fn(duration_msg)
-        elif self.model_cfg.use_duration_predictor:
+        plan_log_frames: Sequence[torch.Tensor | None] = [None] * len(plans)
+        if self.model_cfg.use_duration_predictor and any(
+            plan.manual_seconds is None for plan in plans
+        ):
+            (
+                text_ids,
+                text_mask,
+                caption_ids,
+                caption_mask,
+                speaker_state_override,
+                speaker_mask_override,
+                ref_latent,
+                ref_mask,
+            ) = conditions
             t0 = _measure_start(self.model_device)
             has_speaker_duration = torch.zeros(
-                (num_candidates,), dtype=torch.bool, device=self.model_device
+                (text_ids.shape[0],), dtype=torch.bool, device=self.model_device
             )
             if speaker_mask_override is not None:
                 has_speaker_duration = speaker_mask_override.any(dim=1)
             elif self.model_cfg.use_speaker_condition_resolved and ref_mask is not None:
                 has_speaker_duration = ref_mask.any(dim=1)
             duration_features = build_duration_features(
-                [normalized_text] * num_candidates,
+                [plan.normalized_text for plan in plans for _ in range(plan.num_candidates)],
                 token_counts=text_mask.sum(dim=1),
-                max_text_len=text_max_len,
+                max_text_len=plans[0].text_max_len,
                 has_speaker=has_speaker_duration,
             ).to(self.model_device)
             (
@@ -1613,7 +1627,7 @@ class InferenceRuntime:
                 caption_mask=caption_mask,
                 speaker_state_override=speaker_state_override,
                 speaker_mask_override=speaker_mask_override,
-                speaker_uncond_mode=req.speaker_uncond_mode,
+                speaker_uncond_mode=plans[0].req.speaker_uncond_mode,
             )
             pred_log_frames = self.model.predict_duration_log_frames(
                 text_state=duration_text_state,
@@ -1624,62 +1638,73 @@ class InferenceRuntime:
                 caption_mask=_duration_caption_mask,
                 duration_features=duration_features,
                 has_speaker=has_speaker_duration,
-                has_caption=torch.full(
-                    (num_candidates,),
-                    has_caption_text,
+                has_caption=torch.tensor(
+                    [plan.has_caption_text for plan in plans for _ in range(plan.num_candidates)],
                     dtype=torch.bool,
                     device=self.model_device,
                 )
                 if self.model_cfg.use_caption_condition
                 else None,
             )
-            pred_frames = torch.expm1(pred_log_frames).float().mean().item()
-            scaled_frames = pred_frames * duration_scale
-            min_frames = max(1, math.ceil(min_seconds * self.codec.sample_rate / hop_length))
-            max_frames = max(1, math.floor(max_seconds * self.codec.sample_rate / hop_length))
-            latent_steps = int(round(scaled_frames))
-            latent_steps = max(min_frames, min(max_frames, latent_steps))
-            target_samples = int(latent_steps * hop_length)
+            plan_log_frames = pred_log_frames.split([plan.num_candidates for plan in plans])
             stage_sec = _measure_end(self.model_device, t0)
-            stage_timings.append(("predict_duration", stage_sec))
-            msg = (
-                f"info: predicted duration frames={pred_frames:.1f}, "
-                f"scale={duration_scale:.3f}, using_frames={latent_steps} "
-                f"({target_samples / float(self.codec.sample_rate):.3f}s)."
-            )
-            messages.append(msg)
-            log_fn(msg)
             log_fn(f"[runtime] predict_duration: {stage_sec * 1000.0:.1f} ms")
-        else:
-            fallback_seconds = 30.0
-            target_samples = int(fallback_seconds * self.codec.sample_rate)
-            latent_steps = math.ceil(target_samples / hop_length)
-            msg = "info: checkpoint has no duration predictor; falling back to 30.000s."
-            messages.append(msg)
-            log_fn(msg)
-        plan.latent_steps = latent_steps
-        plan.target_samples = target_samples
-        plan.patched_steps = math.ceil(latent_steps / self.model_cfg.latent_patch_size)
 
-        if isinstance(self.train_cfg, dict):
-            fixed_steps = self.train_cfg.get("fixed_target_latent_steps")
-            if isinstance(fixed_steps, int) and fixed_steps > 0 and latent_steps > fixed_steps:
+        for plan, log_frames in zip(plans, plan_log_frames, strict=True):
+            messages = plan.messages
+            manual_seconds = plan.manual_seconds
+            min_seconds = plan.min_seconds
+            max_seconds = plan.max_seconds
+            if manual_seconds is not None:
+                clamped_seconds = min(max_seconds, max(min_seconds, manual_seconds))
+                if clamped_seconds != manual_seconds:
+                    duration_msg = (
+                        f"warning: manual duration {manual_seconds:.3f}s was clamped to "
+                        f"{clamped_seconds:.3f}s."
+                    )
+                    messages.append(duration_msg)
+                    log_fn(duration_msg)
+                target_samples = max(1, int(clamped_seconds * self.codec.sample_rate))
+                latent_steps = math.ceil(target_samples / hop_length)
+                duration_msg = f"info: using manual duration {clamped_seconds:.3f}s."
+                messages.append(duration_msg)
+                log_fn(duration_msg)
+            elif log_frames is not None:
+                pred_frames = torch.expm1(log_frames).float().mean().item()
+                scaled_frames = pred_frames * plan.duration_scale
+                min_frames = max(1, math.ceil(min_seconds * self.codec.sample_rate / hop_length))
+                max_frames = max(1, math.floor(max_seconds * self.codec.sample_rate / hop_length))
+                latent_steps = int(round(scaled_frames))
+                latent_steps = max(min_frames, min(max_frames, latent_steps))
+                target_samples = int(latent_steps * hop_length)
+                plan.stage_timings.append(("predict_duration", stage_sec))
                 msg = (
-                    f"warning: requested latent length ({latent_steps}) exceeds fixed_target_latent_steps ({fixed_steps}) "
-                    "used in training. Long-tail stability may degrade."
+                    f"info: predicted duration frames={pred_frames:.1f}, "
+                    f"scale={plan.duration_scale:.3f}, using_frames={latent_steps} "
+                    f"({target_samples / float(self.codec.sample_rate):.3f}s)."
                 )
                 messages.append(msg)
                 log_fn(msg)
-        return (
-            text_ids,
-            text_mask,
-            caption_ids,
-            caption_mask,
-            speaker_state_override,
-            speaker_mask_override,
-            ref_latent,
-            ref_mask,
-        )
+            else:
+                fallback_seconds = 30.0
+                target_samples = int(fallback_seconds * self.codec.sample_rate)
+                latent_steps = math.ceil(target_samples / hop_length)
+                msg = "info: checkpoint has no duration predictor; falling back to 30.000s."
+                messages.append(msg)
+                log_fn(msg)
+            plan.latent_steps = latent_steps
+            plan.target_samples = target_samples
+            plan.patched_steps = math.ceil(latent_steps / self.model_cfg.latent_patch_size)
+
+            if isinstance(self.train_cfg, dict):
+                fixed_steps = self.train_cfg.get("fixed_target_latent_steps")
+                if isinstance(fixed_steps, int) and fixed_steps > 0 and latent_steps > fixed_steps:
+                    msg = (
+                        f"warning: requested latent length ({latent_steps}) exceeds fixed_target_latent_steps ({fixed_steps}) "
+                        "used in training. Long-tail stability may degrade."
+                    )
+                    messages.append(msg)
+                    log_fn(msg)
 
     def _finish_request(
         self,
