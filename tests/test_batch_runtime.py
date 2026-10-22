@@ -70,8 +70,8 @@ def make_runtime(tiny_model, monkeypatch):
 
 
 @pytest.fixture
-def runtime(make_runtime) -> InferenceRuntime:
-    return make_runtime()
+def runtime(make_runtime, request) -> InferenceRuntime:
+    return make_runtime(**getattr(request, "param", {}))
 
 
 def write_ref_latents(runtime: InferenceRuntime, tmp_path, lengths: list[int]) -> list[str]:
@@ -98,13 +98,26 @@ def two_requests(runtime, tmp_path) -> list[SamplingRequest]:
     ]
 
 
+@pytest.mark.parametrize(
+    "runtime",
+    [
+        {},
+        {"flow_parameterization": "meanflow"},
+        {"use_duration_predictor": True, "duration_hidden_dim": 32, "duration_attention_heads": 2},
+    ],
+    ids=["rf", "meanflow", "duration-predictor"],
+    indirect=True,
+)
 def test_synthesize_batch_matches_single_requests(runtime, two_requests) -> None:
+    if runtime.model_cfg.use_duration_predictor:
+        two_requests = [replace(req, seconds=None) for req in two_requests]
     batched = runtime.synthesize_batch(two_requests)
     singles = [runtime.synthesize(req) for req in two_requests]
 
     assert len(batched) == len(singles)
     for got, want in zip(batched, singles, strict=True):
         assert got.used_seed == want.used_seed
+        assert got.messages == want.messages
         assert [a.shape for a in got.audios] == [a.shape for a in want.audios]
         for got_audio, want_audio in zip(got.audios, want.audios, strict=True):
             torch.testing.assert_close(got_audio, want_audio)
