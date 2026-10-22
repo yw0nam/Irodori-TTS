@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -165,3 +166,92 @@ def test_reference_wavs_are_encoded_once_per_unchanged_file(runtime, tmp_path) -
 
     assert runtime.codec.encode_calls == 4
     assert not torch.equal(third.audios[0], first.audios[0])
+
+
+def using_frames(result) -> int:
+    (msg,) = [m for m in result.messages if "using_frames=" in m]
+    return int(re.search(r"using_frames=(\d+)", msg).group(1))
+
+
+@pytest.fixture
+def duration_runtime(make_runtime) -> InferenceRuntime:
+    return make_runtime(use_duration_predictor=True)
+
+
+def count_duration_calls(runtime: InferenceRuntime) -> list[int]:
+    calls = []
+    predict = runtime.model.predict_duration_log_frames
+
+    def counted(**kwargs):
+        calls.append(kwargs["text_state"].shape[0])
+        return predict(**kwargs)
+
+    runtime.model.predict_duration_log_frames = counted
+    return calls
+
+
+def test_synthesize_batch_predicts_durations_in_one_call(duration_runtime, tmp_path) -> None:
+    paths = write_ref_latents(duration_runtime, tmp_path, [6, 11])
+    # The tiny model predicts about 3 and 7.3 frames; b's 1.0 s cap (10 frames) clamps 1.5 x 7.3.
+    a = SamplingRequest(
+        text="hi",
+        ref_latent=paths[0],
+        num_candidates=2,
+        seed=1,
+        num_steps=4,
+        duration_scale=2.0,
+        min_seconds=0.1,
+        max_seconds=100.0,
+        trim_tail=False,
+    )
+    b = SamplingRequest(
+        text="a longer line",
+        ref_latent=paths[1],
+        seed=2,
+        num_steps=4,
+        duration_scale=1.5,
+        min_seconds=0.1,
+        max_seconds=1.0,
+        trim_tail=False,
+    )
+    calls = count_duration_calls(duration_runtime)
+
+    batched = duration_runtime.synthesize_batch([a, b])
+
+    assert calls == [3]
+    singles = [duration_runtime.synthesize(a), duration_runtime.synthesize(b)]
+    assert using_frames(singles[1]) == 10
+    for got, want in zip(batched, singles, strict=True):
+        assert using_frames(got) == using_frames(want)
+        assert [x.shape for x in got.audios] == [x.shape for x in want.audios]
+
+
+def test_synthesize_batch_mixes_manual_and_predicted_durations(duration_runtime, tmp_path) -> None:
+    paths = write_ref_latents(duration_runtime, tmp_path, [6, 11])
+    manual = SamplingRequest(
+        text="hi",
+        ref_latent=paths[0],
+        seconds=0.5,
+        seed=1,
+        num_steps=4,
+        min_seconds=0.1,
+        max_seconds=100.0,
+        trim_tail=False,
+    )
+    predicted = SamplingRequest(
+        text="a longer line",
+        ref_latent=paths[1],
+        seed=2,
+        num_steps=4,
+        min_seconds=0.1,
+        max_seconds=100.0,
+        trim_tail=False,
+    )
+
+    got_manual, got_predicted = duration_runtime.synthesize_batch([manual, predicted])
+
+    assert "info: using manual duration 0.500s." in got_manual.messages
+    assert got_manual.audio.shape[-1] == 5 * HOP_LENGTH
+    want = duration_runtime.synthesize(predicted)
+    assert using_frames(got_predicted) == using_frames(want)
+    assert got_predicted.audio.shape == want.audio.shape
