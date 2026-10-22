@@ -200,6 +200,9 @@ attention uses FlashAttention-3 automatically. Unsupported devices or wheels fal
 SDPA. Set `IRODORI_ATTENTION_BACKEND=sdpa` to force the fallback for troubleshooting or numerical
 comparisons.
 
+Masked SDPA tries cuDNN first. cuDNN builds an execution plan for each new input shape, so a
+server whose request lengths vary can run faster with `IRODORI_SDPA_CUDNN=0`, which skips cuDNN.
+
 ### Tail Trimming and Timings
 
 | Parameter | Default | Notes |

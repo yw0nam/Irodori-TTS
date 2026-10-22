@@ -14,6 +14,7 @@ padding). The FA3 ``seqused`` paths rely on that invariant; callers must not
 pass masks with holes.
 
 Set ``IRODORI_ATTENTION_BACKEND=sdpa`` to disable the FA3 paths at runtime.
+Set ``IRODORI_SDPA_CUDNN=0`` to drop cuDNN from the SDPA priority.
 """
 
 from __future__ import annotations
@@ -46,6 +47,13 @@ _fa3_device_ok_cache: dict[int, bool] = {}
 
 def _fa3_disabled() -> bool:
     return os.environ.get("IRODORI_ATTENTION_BACKEND", "").strip().lower() == "sdpa"
+
+
+def _sdpa_priority() -> list[SDPBackend]:
+    # cuDNN builds an execution plan per new shape, which dominates variable-length inference.
+    if os.environ.get("IRODORI_SDPA_CUDNN", "").strip() == "0":
+        return _SDPA_PRIORITY[1:]
+    return _SDPA_PRIORITY
 
 
 def _fa3_probe(device: torch.device) -> bool:
@@ -132,10 +140,10 @@ def masked_sdpa(
     v: torch.Tensor,
     attn_mask: torch.Tensor | None,
 ) -> torch.Tensor:
-    """SDPA in (B, S, H, D) layout with the cuDNN-first backend priority."""
+    """SDPA in (B, S, H, D) layout with the masked-attention backend priority."""
     if attn_mask is None or not q.is_cuda:
         return _sdpa(q, k, v, attn_mask)
-    with sdpa_kernel(_SDPA_PRIORITY, set_priority=True):
+    with sdpa_kernel(_sdpa_priority(), set_priority=True):
         return _sdpa(q, k, v, attn_mask)
 
 
